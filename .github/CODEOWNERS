@@ -1,0 +1,6 @@
+# Every change to the data model, security surface or regulatory docs needs review.
+/backend/prisma/       @tech-lead @data-protection
+/backend/src/lib/      @tech-lead
+/backend/src/modules/screening/ @tech-lead @regulatory
+/docs/                 @regulatory @tech-lead
+/.github/              @tech-lead

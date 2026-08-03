@@ -1,0 +1,357 @@
+// ADHD Care Hub — data model
+//
+// Design notes (see docs/compliance-gdpr.md):
+//  - Identity (User) and personal detail (Profile) are separated so health records
+//    can be joined on a pseudonymous user id rather than on a name or email.
+//  - Every table holding health data carries createdAt/updatedAt and is covered by
+//    the AuditEvent trail.
+//  - Erasure is soft-delete first (deletedAt) so audit obligations survive, then a
+//    scheduled hard-purge job removes payloads. Do not hard-delete AuditEvent rows.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ---------------------------------------------------------------- identity ---
+
+enum Role {
+  PATIENT
+  CLINICIAN
+  COACH
+  ADMIN
+}
+
+enum UserStatus {
+  PENDING_VERIFICATION
+  ACTIVE
+  SUSPENDED
+  DEACTIVATED
+}
+
+model User {
+  id           String     @id @default(uuid())
+  email        String     @unique
+  passwordHash String
+  role         Role       @default(PATIENT)
+  status       UserStatus @default(PENDING_VERIFICATION)
+  mfaSecret    String?
+  lastLoginAt  DateTime?
+  createdAt    DateTime   @default(now())
+  updatedAt    DateTime   @updatedAt
+  deletedAt    DateTime?
+
+  profile           Profile?
+  consents          ConsentRecord[]
+  refreshTokens     RefreshToken[]
+  screeningSessions ScreeningSession[]
+  checkIns          DailyCheckIn[]
+  routines          Routine[]
+  patientBookings   Consultation[]     @relation("PatientConsultations")
+  providerBookings  Consultation[]     @relation("ProviderConsultations")
+  providerSlots     AvailabilitySlot[]
+  enrolments        CoachingEnrolment[]
+  auditEvents       AuditEvent[]
+
+  @@index([status])
+}
+
+model Profile {
+  id          String    @id @default(uuid())
+  userId      String    @unique
+  user        User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  firstName   String
+  lastName    String
+  dateOfBirth DateTime?
+  phone       String?
+  locale      String    @default("de-DE")
+  timezone    String    @default("Europe/Berlin")
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+}
+
+model RefreshToken {
+  id        String    @id @default(uuid())
+  userId    String
+  user      User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  tokenHash String    @unique
+  expiresAt DateTime
+  revokedAt DateTime?
+  userAgent String?
+  ipHash    String?
+  createdAt DateTime  @default(now())
+
+  @@index([userId])
+}
+
+// ----------------------------------------------------------------- consent ---
+
+enum ConsentType {
+  TERMS_OF_USE
+  PRIVACY_POLICY
+  HEALTH_DATA_PROCESSING // GDPR Art. 9(2)(a) — explicit consent
+  MARKETING
+  RESEARCH
+}
+
+model ConsentRecord {
+  id          String      @id @default(uuid())
+  userId      String
+  user        User        @relation(fields: [userId], references: [id], onDelete: Cascade)
+  type        ConsentType
+  documentVersion String
+  grantedAt   DateTime    @default(now())
+  withdrawnAt DateTime?
+
+  @@index([userId, type])
+}
+
+// --------------------------------------------------------------- screening ---
+// The MVP is explicitly non-diagnostic: sessions produce an indication band and a
+// referral prompt, never a diagnosis. See docs/mdr-positioning.md before changing
+// anything in this module.
+
+model ScreeningInstrument {
+  id          String   @id @default(uuid())
+  code        String   @unique // e.g. "ASRS_V1_1_PARTA"
+  name        String
+  version     String
+  locale      String   @default("de-DE")
+  // Populate only with content you are licensed to display. Item wording for
+  // published instruments is usually copyrighted — store the licensed text here,
+  // do not hard-code it in the application.
+  licenseNote String?
+  isActive    Boolean  @default(true)
+  createdAt   DateTime @default(now())
+
+  items    ScreeningItem[]
+  sessions ScreeningSession[]
+}
+
+model ScreeningItem {
+  id           String              @id @default(uuid())
+  instrumentId String
+  instrument   ScreeningInstrument @relation(fields: [instrumentId], references: [id], onDelete: Cascade)
+  ordinal      Int
+  text         String
+  // Score contributed per answer option, e.g. { "0": 0, "1": 0, "2": 1, "3": 1 }
+  scoringMap   Json
+
+  responses ScreeningResponse[]
+
+  @@unique([instrumentId, ordinal])
+}
+
+enum ScreeningStatus {
+  IN_PROGRESS
+  COMPLETED
+  ABANDONED
+}
+
+enum IndicationBand {
+  LOW
+  MODERATE
+  HIGH
+}
+
+model ScreeningSession {
+  id             String              @id @default(uuid())
+  userId         String
+  user           User                @relation(fields: [userId], references: [id], onDelete: Cascade)
+  instrumentId   String
+  instrument     ScreeningInstrument @relation(fields: [instrumentId], references: [id])
+  status         ScreeningStatus     @default(IN_PROGRESS)
+  rawScore       Int?
+  indicationBand IndicationBand?
+  // Records that the user saw the "this is not a diagnosis" notice before results.
+  disclaimerAckAt DateTime?
+  startedAt      DateTime            @default(now())
+  completedAt    DateTime?
+
+  responses ScreeningResponse[]
+
+  @@index([userId, startedAt])
+}
+
+model ScreeningResponse {
+  id        String           @id @default(uuid())
+  sessionId String
+  session   ScreeningSession @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+  itemId    String
+  item      ScreeningItem    @relation(fields: [itemId], references: [id])
+  value     Int
+  answeredAt DateTime        @default(now())
+
+  @@unique([sessionId, itemId])
+}
+
+// ----------------------------------------------------------- consultations ---
+
+enum ConsultationStatus {
+  REQUESTED
+  CONFIRMED
+  COMPLETED
+  CANCELLED
+  NO_SHOW
+}
+
+model AvailabilitySlot {
+  id         String   @id @default(uuid())
+  providerId String
+  provider   User     @relation(fields: [providerId], references: [id], onDelete: Cascade)
+  startsAt   DateTime
+  endsAt     DateTime
+  isBooked   Boolean  @default(false)
+  createdAt  DateTime @default(now())
+
+  consultation Consultation?
+
+  @@index([providerId, startsAt])
+}
+
+model Consultation {
+  id          String             @id @default(uuid())
+  patientId   String
+  patient     User               @relation("PatientConsultations", fields: [patientId], references: [id])
+  providerId  String
+  provider    User               @relation("ProviderConsultations", fields: [providerId], references: [id])
+  slotId      String?            @unique
+  slot        AvailabilitySlot?  @relation(fields: [slotId], references: [id])
+  scheduledAt DateTime
+  durationMin Int                @default(30)
+  status      ConsultationStatus @default(REQUESTED)
+  // Opaque room identifier issued by the video provider. Never store recordings.
+  videoRoomId String?
+  reasonForVisit String?
+  // Encrypted at the application layer before persistence (see lib/crypto.ts)
+  clinicalNoteCipher String?
+  createdAt   DateTime           @default(now())
+  updatedAt   DateTime           @updatedAt
+
+  @@index([patientId, scheduledAt])
+  @@index([providerId, scheduledAt])
+}
+
+// ---------------------------------------------------------------- coaching ---
+
+model CoachingProgram {
+  id          String   @id @default(uuid())
+  slug        String   @unique
+  title       String
+  summary     String
+  weeks       Int
+  isPublished Boolean  @default(false)
+  createdAt   DateTime @default(now())
+
+  modules    CoachingModule[]
+  enrolments CoachingEnrolment[]
+}
+
+model CoachingModule {
+  id        String          @id @default(uuid())
+  programId String
+  program   CoachingProgram @relation(fields: [programId], references: [id], onDelete: Cascade)
+  ordinal   Int
+  title     String
+  body      String
+
+  progress ModuleProgress[]
+
+  @@unique([programId, ordinal])
+}
+
+model CoachingEnrolment {
+  id          String          @id @default(uuid())
+  userId      String
+  user        User            @relation(fields: [userId], references: [id], onDelete: Cascade)
+  programId   String
+  program     CoachingProgram @relation(fields: [programId], references: [id])
+  startedAt   DateTime        @default(now())
+  completedAt DateTime?
+
+  progress ModuleProgress[]
+
+  @@unique([userId, programId])
+}
+
+model ModuleProgress {
+  id          String            @id @default(uuid())
+  enrolmentId String
+  enrolment   CoachingEnrolment @relation(fields: [enrolmentId], references: [id], onDelete: Cascade)
+  moduleId    String
+  module      CoachingModule    @relation(fields: [moduleId], references: [id], onDelete: Cascade)
+  completedAt DateTime?
+
+  @@unique([enrolmentId, moduleId])
+}
+
+// -------------------------------------------------------- daily management ---
+
+model DailyCheckIn {
+  id           String   @id @default(uuid())
+  userId       String
+  user         User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  date         DateTime @db.Date
+  focusRating  Int // 1-5
+  moodRating   Int // 1-5
+  sleepHours   Float?
+  notes        String?
+  createdAt    DateTime @default(now())
+
+  @@unique([userId, date])
+  @@index([userId, date])
+}
+
+enum RoutineCadence {
+  DAILY
+  WEEKDAYS
+  WEEKLY
+}
+
+model Routine {
+  id        String         @id @default(uuid())
+  userId    String
+  user      User           @relation(fields: [userId], references: [id], onDelete: Cascade)
+  title     String
+  cadence   RoutineCadence @default(DAILY)
+  timeOfDay String? // "HH:mm" in the user's timezone
+  isActive  Boolean        @default(true)
+  createdAt DateTime       @default(now())
+
+  completions RoutineCompletion[]
+
+  @@index([userId, isActive])
+}
+
+model RoutineCompletion {
+  id        String   @id @default(uuid())
+  routineId String
+  routine   Routine  @relation(fields: [routineId], references: [id], onDelete: Cascade)
+  date      DateTime @db.Date
+  createdAt DateTime @default(now())
+
+  @@unique([routineId, date])
+}
+
+// ------------------------------------------------------------------- audit ---
+// Append-only. No update or delete paths should exist in application code.
+
+model AuditEvent {
+  id         String   @id @default(uuid())
+  actorId    String?
+  actor      User?    @relation(fields: [actorId], references: [id])
+  action     String // e.g. "screening.session.completed"
+  entityType String
+  entityId   String?
+  ipHash     String?
+  userAgent  String?
+  metadata   Json?
+  createdAt  DateTime @default(now())
+
+  @@index([actorId, createdAt])
+  @@index([entityType, entityId])
+}
